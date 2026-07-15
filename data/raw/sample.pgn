@@ -1,0 +1,38 @@
+[Event "Rated Blitz game"]
+[Site "https://lichess.org/abc12345"]
+[White "player1"]
+[Black "player2"]
+[Result "1-0"]
+[WhiteElo "1850"]
+[BlackElo "1790"]
+[ECO "C50"]
+[Opening "Italian Game"]
+[TimeControl "300+0"]
+
+1. e4 e5 2. Nf3 Nc6 3. Bc4 Bc5 4. c3 Nf6 5. d3 d6 6. O-O O-O 7. Re1 a6 1-0
+
+[Event "Rated Bullet game"]
+[Site "https://lichess.org/def67890"]
+[White "player3"]
+[Black "player4"]
+[Result "0-1"]
+[WhiteElo "2100"]
+[BlackElo "2150"]
+[ECO "B01"]
+[Opening "Scandinavian Defense"]
+[TimeControl "60+0"]
+
+1. e4 d5 2. exd5 Qxd5 3. Nc3 Qa5 4. d4 Nf6 5. Nf3 c6 0-1
+
+[Event "Rated Blitz game"]
+[Site "https://lichess.org/ghi11111"]
+[White "player5"]
+[Black "player6"]
+[Result "1/2-1/2"]
+[WhiteElo "1200"]
+[BlackElo "1180"]
+[ECO "A00"]
+[Opening "Irregular"]
+[TimeControl "180+2"]
+
+1. g3 g6 2. Bg2 Bg7 3. c4 c5 1/2-1/2

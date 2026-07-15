@@ -1,0 +1,17 @@
+# entorno
+.venv/
+venv/
+__pycache__/
+*.pyc
+
+# IDE
+.idea/
+
+# datos (son pesados, no van al repo; solo el código para generarlos/procesarlos)
+data/raw/*.pgn
+data/raw/*.pgn.zst
+data/processed/*.csv
+
+# excepciones: sí queremos versionar el PGN de muestra y las carpetas vacías
+!data/raw/sample.pgn
+!data/processed/.gitkeep

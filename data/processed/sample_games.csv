@@ -1,0 +1,4 @@
+white_elo,black_elo,eco,opening,result,num_plies,time_control
+1850,1790,C50,Italian Game,1-0,14,300+0
+2100,2150,B01,Scandinavian Defense,0-1,10,60+0
+1200,1180,A00,Irregular,1/2-1/2,6,180+2

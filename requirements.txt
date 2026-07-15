@@ -1,0 +1,6 @@
+python-chess
+pandas
+scikit-learn
+zstandard~=0.25.0
+
+chess~=1.11.2
