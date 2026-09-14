@@ -1,14 +1,14 @@
 """
 extract_sample.py
 
-Descomprime un archivo .pgn.zst de Lichess "al vuelo" (streaming) y guarda
-solo las primeras N partidas en un .pgn normal y manejable. Nunca escribe
-a disco el archivo descomprimido completo, que para un mes de Lichess
-puede pesar cientos de GB.
+Decompresses a Lichess .pgn.zst file "on the fly" (streaming) and saves
+only the first N games into a regular, manageable .pgn file. It never
+writes the full decompressed file to disk, which for a single Lichess
+month can be hundreds of GB.
 
-Requiere: pip install zstandard
+Requires: pip install zstandard
 
-Uso:
+Usage:
     python src/extract_sample.py --input E:\\lichess_data\\lichess_db_standard_rated_2024-01.pgn.zst ^
                                   --output data/raw/lichess_sample.pgn ^
                                   --max-games 20000
@@ -22,8 +22,8 @@ import zstandard as zstd
 
 
 def extract_games(input_path: str, output_path: str, max_games: int) -> int:
-    """Lee partidas directamente del stream comprimido y escribe las
-    primeras `max_games` a un .pgn de texto plano."""
+    """Reads games directly from the compressed stream and writes the
+    first `max_games` to a plain-text .pgn file."""
     dctx = zstd.ZstdDecompressor()
     games_written = 0
 
@@ -35,29 +35,29 @@ def extract_games(input_path: str, output_path: str, max_games: int) -> int:
         while games_written < max_games:
             game = chess.pgn.read_game(text_stream)
             if game is None:
-                break  # se acabo el archivo comprimido antes de llegar al limite
+                break  # the compressed file ended before reaching the limit
 
-            # re-escribimos la partida ya parseada como PGN valido
+            # re-write the already-parsed game as valid PGN
             print(game, file=out_file, end="\n\n")
             games_written += 1
 
             if games_written % 1000 == 0:
-                print(f"Extraidas {games_written} partidas...")
+                print(f"Extracted {games_written} games...")
 
     return games_written
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Extrae las primeras N partidas de un .pgn.zst de Lichess sin descomprimir todo el archivo."
+        description="Extracts the first N games from a Lichess .pgn.zst file without decompressing the whole thing."
     )
-    parser.add_argument("--input", required=True, help="Ruta al archivo .pgn.zst original")
-    parser.add_argument("--output", required=True, help="Ruta al .pgn de salida (mucho mas chico)")
-    parser.add_argument("--max-games", type=int, default=20000, help="Numero de partidas a extraer")
+    parser.add_argument("--input", required=True, help="Path to the original .pgn.zst file")
+    parser.add_argument("--output", required=True, help="Path to the output .pgn file (much smaller)")
+    parser.add_argument("--max-games", type=int, default=20000, help="Number of games to extract")
     args = parser.parse_args()
 
     total = extract_games(args.input, args.output, args.max_games)
-    print(f"Listo. {total} partidas escritas en {args.output}")
+    print(f"Done. {total} games written to {args.output}")
 
 
 if __name__ == "__main__":

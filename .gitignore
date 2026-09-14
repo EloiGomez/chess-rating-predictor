@@ -1,0 +1,24 @@
+# Virtual environment
+.venv/
+__pycache__/
+*.pyc
+
+# Chess engine (downloaded separately, not project code)
+stockfish/
+
+# Data: only the sample PGNs shipped with the repo are versioned
+data/raw/*
+!data/raw/sample.pgn
+!data/raw/lichess_sample.pgn
+data/processed/*
+!data/processed/.gitkeep
+!data/processed/sample_games.csv
+
+# Logs from select_games_by_player.py / analyze_with_stockfish.py runs
+logs/
+
+# Old stray log file
+log_seleccion.txt
+
+# IDE
+.idea/

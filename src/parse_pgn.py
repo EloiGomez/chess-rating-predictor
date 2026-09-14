@@ -1,15 +1,15 @@
 """
 parse_pgn.py
 
-Lee un archivo PGN (partidas de ajedrez) y extrae, por cada partida, un
-conjunto de features basicos a un CSV: rating de ambos jugadores, apertura
-(ECO), numero de jugadas, resultado y control de tiempo.
+Reads a PGN file (chess games) and extracts, for each game, a set of
+basic features into a CSV: both players' ratings, opening (ECO), number
+of plies, result and time control.
 
-Esta es la version "MVP": no usa Stockfish todavia, solo lo que ya viene
-en las cabeceras del PGN y en la secuencia de jugadas. Es el primer paso
-para validar que el pipeline completo funciona de punta a punta.
+This is the "MVP" version: it doesn't use Stockfish yet, only what's
+already in the PGN headers and the move sequence. It's the first step to
+validate that the full pipeline works end to end.
 
-Uso:
+Usage:
     python src/parse_pgn.py --input data/raw/lichess_sample.pgn \
                              --output data/processed/games.csv \
                              --max-games 10000
@@ -24,9 +24,9 @@ import chess.pgn
 
 
 def parse_games(input_path: str, output_path: str, max_games: Optional[int] = None) -> int:
-    """Parsea partidas de un archivo PGN y las escribe como filas de un CSV.
+    """Parses games from a PGN file and writes them as rows of a CSV.
 
-    Devuelve el numero total de partidas escritas.
+    Returns the total number of games written.
     """
     count = 0
 
@@ -50,14 +50,14 @@ def parse_games(input_path: str, output_path: str, max_games: Optional[int] = No
 
             game = chess.pgn.read_game(pgn_file)
             if game is None:
-                break  # fin del archivo
+                break  # end of file
 
             headers = game.headers
 
             white_elo = headers.get("WhiteElo", "")
             black_elo = headers.get("BlackElo", "")
 
-            # nos saltamos partidas sin rating (bots, partidas casuales sin clasificar)
+            # skip games without a rating (bots, unrated casual games)
             if not white_elo.isdigit() or not black_elo.isdigit():
                 continue
 
@@ -80,25 +80,25 @@ def parse_games(input_path: str, output_path: str, max_games: Optional[int] = No
 
             count += 1
             if count % 1000 == 0:
-                print(f"Procesadas {count} partidas...", file=sys.stderr)
+                print(f"Processed {count} games...", file=sys.stderr)
 
     return count
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Parsea un archivo PGN a un CSV con features basicos por partida."
+        description="Parses a PGN file into a CSV with basic per-game features."
     )
-    parser.add_argument("--input", required=True, help="Ruta al archivo .pgn de entrada")
-    parser.add_argument("--output", required=True, help="Ruta al archivo .csv de salida")
+    parser.add_argument("--input", required=True, help="Path to the input .pgn file")
+    parser.add_argument("--output", required=True, help="Path to the output .csv file")
     parser.add_argument(
         "--max-games", type=int, default=None,
-        help="Numero maximo de partidas a procesar (util para pruebas rapidas)",
+        help="Maximum number of games to process (useful for quick tests)",
     )
     args = parser.parse_args()
 
     total = parse_games(args.input, args.output, args.max_games)
-    print(f"Listo. {total} partidas escritas en {args.output}")
+    print(f"Done. {total} games written to {args.output}")
 
 
 if __name__ == "__main__":
