@@ -1,8 +1,10 @@
 # Chess Rating Predictor
 
-Machine learning project that predicts a Lichess player's rating (Elo)
-from a handful of their own games in PGN format -- either fetched live
-from the Lichess API or uploaded as a PGN file.
+Machine learning project that predicts a player's **Lichess** rating (their
+Glicko-2 Elo on lichess.org, specifically -- not a FIDE/USCF rating or a
+generic "chess skill" score, and not transferable to those) from a
+handful of their own games in PGN format, either fetched live from the
+Lichess API or uploaded as a PGN file.
 
 The core idea: the outcome of a single game is noisy (a bad day, an odd
 opponent), but averaging move-quality features over 5-15 games of the
