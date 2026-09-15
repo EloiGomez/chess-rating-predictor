@@ -66,6 +66,21 @@ collect their games), covering ALL target categories in each single pass
     of those players hadn't accumulated their minimum yet, so pruning
     left far fewer players than expected).
 
+    Pass 2 also samples EACH category's players in a STRATIFIED way across
+    Elo bands (ELO_BUCKET_WIDTH-point buckets), instead of just taking
+    whichever eligible players happen to show up first while scanning.
+    Without this, the selection ends up shaped like Lichess's overall
+    rating distribution -- heavily concentrated around the median, with
+    almost no players at the tails -- because prolific players near the
+    median contribute a disproportionate share of raw games in the file.
+    A model trained on that skew learns the middle of the range well and
+    is unreliable for anyone far from it (a 3200-rated player looks
+    nothing like anyone the model has seen). Pass 1 also tracks each
+    player's mean Elo (not just their game count) so pass 2 can target a
+    roughly even number of qualified players FROM EACH BUCKET (capped by
+    how many are actually available in that bucket -- sparse extreme
+    buckets will naturally end up smaller, that's expected, not an error).
+
 Pass 1 cache (eligible players per category). If ELIGIBLE_CACHE_PATH
 already exists, pass 1 is SKIPPED entirely and the cached result is used
 instead -- that way, if pass 2 fails or gets interrupted, or you want to
@@ -86,6 +101,7 @@ Usage:
 
 import io
 import json
+import math
 import os
 import re
 import sys
@@ -115,6 +131,13 @@ MAX_GAMES_PER_PLAYER = 15   # stops one very active player from dominating the s
 # docstring above). With MAX_GAMES_PER_PLAYER as a cap, each category's
 # final dataset will have at most TARGET_PLAYERS_PER_CATEGORY * 15 games.
 TARGET_PLAYERS_PER_CATEGORY = 3_000
+
+# Width, in Elo points, of the bands pass 2 tries to sample evenly from
+# (see the docstring above). Finer buckets (lower width) give more
+# granular coverage of the rating range, at the cost of a lower per-bucket
+# target (target_players_per_category / n_buckets) -- which bites hardest
+# in the already-sparse extreme buckets.
+ELO_BUCKET_WIDTH = 100
 
 MIN_PLIES = 10              # discards near-empty / aborted games
 LOG_EVERY_PASS1 = 2_000_000  # how often (in headers read) to print progress
@@ -268,6 +291,13 @@ def estimate_speed_category(time_control: str) -> str:
         return "classical"
 
 
+def elo_bucket(elo: float) -> str:
+    """Labels an Elo value with its ELO_BUCKET_WIDTH-point band, e.g.
+    1450 -> "1400-1600"."""
+    lower = int(elo // ELO_BUCKET_WIDTH) * ELO_BUCKET_WIDTH
+    return f"{lower}-{lower + ELO_BUCKET_WIDTH}"
+
+
 # --- Filters -----------------------------------------------------------
 
 def passes_header_filters(headers) -> bool:
@@ -300,8 +330,11 @@ def passes_header_filters(headers) -> bool:
 def first_pass_count_players(path, target_categories, log):
     """Scans the whole file reading only headers (chess.pgn.read_headers,
     which skips the rest of the game without tokenizing moves) and counts
-    how many valid games each player has IN EACH TARGET CATEGORY."""
+    how many valid games each player has IN EACH TARGET CATEGORY, plus the
+    sum of their Elo across those games (so a mean Elo -- used to bucket
+    them for stratified sampling in pass 2 -- can be computed afterwards)."""
     counts = {cat: {} for cat in target_categories}
+    elo_sums = {cat: {} for cat in target_categories}
     n_read = 0
     start = time.time()
 
@@ -323,35 +356,95 @@ def first_pass_count_players(path, target_categories, log):
                 continue
 
             player_counts = counts[category]
-            for player in (headers["White"], headers["Black"]):
+            player_elo_sums = elo_sums[category]
+            for player, elo_str in (
+                (headers["White"], headers["WhiteElo"]),
+                (headers["Black"], headers["BlackElo"]),
+            ):
                 player_counts[player] = player_counts.get(player, 0) + 1
+                player_elo_sums[player] = player_elo_sums.get(player, 0) + int(elo_str)
 
     elapsed = time.time() - start
     rate = n_read / elapsed if elapsed else 0
     log(f"Pass 1 complete: {n_read:,} games read in total ({elapsed:.0f}s, {rate:,.0f} games/s).")
-    return counts
+    return counts, elo_sums
+
+
+def build_elo_buckets(eligible_players, player_mean_elo, target_players_per_category, log):
+    """Assigns each eligible player to an Elo bucket and works out, per
+    category, how many qualified players pass 2 should aim to collect FROM
+    EACH bucket: the target split evenly across that category's populated
+    buckets, capped at how many eligible players actually exist in a given
+    bucket (a sparse bucket just ends up smaller -- there's no way to
+    manufacture players who aren't in the data)."""
+    player_bucket = {}
+    bucket_target = {}
+
+    for cat, players in eligible_players.items():
+        player_bucket[cat] = {p: elo_bucket(player_mean_elo[cat][p]) for p in players}
+
+        pool_size = {}
+        for bucket in player_bucket[cat].values():
+            pool_size[bucket] = pool_size.get(bucket, 0) + 1
+
+        n_buckets = len(pool_size)
+        even_share = math.ceil(target_players_per_category / n_buckets) if n_buckets else 0
+        bucket_target[cat] = {bucket: min(even_share, size) for bucket, size in pool_size.items()}
+
+        achievable = sum(bucket_target[cat].values())
+        log(f"[{cat}] Elo buckets (target {even_share}/bucket, capped by availability):")
+        for bucket in sorted(bucket_target[cat], key=lambda b: int(b.split("-")[0])):
+            log(f"    {bucket:>11}: {bucket_target[cat][bucket]:>5,} target (of {pool_size[bucket]:,} eligible)")
+        log(f"[{cat}] Achievable total across all buckets: {achievable:,} "
+            f"(requested {target_players_per_category:,})")
+
+    return player_bucket, bucket_target
+
+
+def _player_wanted(player, counts_for_cat, bucket_of, qualified_by_bucket, bucket_target):
+    """Whether a game should be counted towards this player: keeps
+    accumulating an already-qualified player up to MAX_GAMES_PER_PLAYER
+    regardless of their bucket's status (their games are "sunk cost", more
+    of them only helps), but for a player NOT YET qualified, only starts
+    counting if their bucket hasn't already reached its target -- no point
+    accumulating a new player from an already-satisfied bucket, we'd just
+    prune them at the end anyway."""
+    if player not in counts_for_cat:
+        return False
+    current = counts_for_cat[player]
+    if current >= MAX_GAMES_PER_PLAYER:
+        return False
+    if current >= MIN_GAMES_PER_PLAYER:
+        return True
+    bucket = bucket_of[player]
+    return len(qualified_by_bucket[bucket]) < bucket_target[bucket]
 
 
 # --- Pass 2: select games from the eligible players -------------------------
 
-def second_pass_select_games(path, eligible_players, target_players_per_category, log):
+def second_pass_select_games(path, eligible_players, player_bucket, bucket_target, log):
     """Scans the file again with read_raw_game() (without building a
     single chess.pgn.Game object) and, for each (category, eligible
     player), saves up to MAX_GAMES_PER_PLAYER games that pass the filters
-    in that category.
+    in that category -- sampling players FROM EACH ELO BUCKET (see
+    build_elo_buckets) rather than just whoever shows up first.
 
-    Stops as soon as EVERY category has `target_players_per_category`
-    players who reached MIN_GAMES_PER_PLAYER ACCEPTED games (not raw games
-    read), or once the end of the file is reached."""
+    Stops as soon as EVERY bucket of EVERY category has reached its target
+    number of qualified players (MIN_GAMES_PER_PLAYER ACCEPTED games, not
+    raw games read), or once the end of the file is reached."""
     categories = list(eligible_players.keys())
     selected_count = {cat: {p: 0 for p in eligible_players[cat]} for cat in categories}
-    qualified_players = {cat: set() for cat in categories}
+    qualified_by_bucket = {cat: {b: set() for b in bucket_target[cat]} for cat in categories}
     selected_games = {cat: [] for cat in categories}
     n_read = 0
     start = time.time()
 
     def all_categories_done():
-        return all(len(qualified_players[cat]) >= target_players_per_category for cat in categories)
+        return all(
+            len(qualified_by_bucket[cat][b]) >= target
+            for cat in categories
+            for b, target in bucket_target[cat].items()
+        )
 
     # Interruptions/errors are caught HERE (not in main()) so that if
     # something cuts pass 2 short, whatever is already in selected_games
@@ -368,7 +461,8 @@ def second_pass_select_games(path, eligible_players, target_players_per_category
                 if n_read % LOG_EVERY_PASS2 == 0:
                     elapsed = time.time() - start
                     progress = ", ".join(
-                        f"{cat}: {len(qualified_players[cat]):,}/{target_players_per_category:,}"
+                        f"{cat}: {sum(len(s) for s in qualified_by_bucket[cat].values()):,}/"
+                        f"{sum(bucket_target[cat].values()):,}"
                         for cat in categories
                     )
                     log(f"  [pass 2] {n_read:,} games read ({progress}) ({n_read / elapsed:,.0f} games/s)")
@@ -378,9 +472,13 @@ def second_pass_select_games(path, eligible_players, target_players_per_category
                     continue
 
                 counts_for_cat = selected_count[category]
+                bucket_of = player_bucket[category]
+                qualified_for_cat = qualified_by_bucket[category]
+                target_for_cat = bucket_target[category]
+
                 white, black = headers.get("White", ""), headers.get("Black", "")
-                white_wanted = white in counts_for_cat and counts_for_cat[white] < MAX_GAMES_PER_PLAYER
-                black_wanted = black in counts_for_cat and counts_for_cat[black] < MAX_GAMES_PER_PLAYER
+                white_wanted = _player_wanted(white, counts_for_cat, bucket_of, qualified_for_cat, target_for_cat)
+                black_wanted = _player_wanted(black, counts_for_cat, bucket_of, qualified_for_cat, target_for_cat)
 
                 if not (white_wanted or black_wanted):
                     continue
@@ -392,11 +490,11 @@ def second_pass_select_games(path, eligible_players, target_players_per_category
                 if white_wanted:
                     counts_for_cat[white] += 1
                     if counts_for_cat[white] == MIN_GAMES_PER_PLAYER:
-                        qualified_players[category].add(white)
+                        qualified_for_cat[bucket_of[white]].add(white)
                 if black_wanted:
                     counts_for_cat[black] += 1
                     if counts_for_cat[black] == MIN_GAMES_PER_PLAYER:
-                        qualified_players[category].add(black)
+                        qualified_for_cat[bucket_of[black]].add(black)
 
                 if all_categories_done():
                     break
@@ -409,7 +507,9 @@ def second_pass_select_games(path, eligible_players, target_players_per_category
 
     elapsed = time.time() - start
     rate = n_read / elapsed if elapsed else 0
-    summary = ", ".join(f"{cat}: {len(qualified_players[cat]):,} players" for cat in categories)
+    summary = ", ".join(
+        f"{cat}: {sum(len(s) for s in qualified_by_bucket[cat].values()):,} players" for cat in categories
+    )
     log(f"Pass 2 complete: {n_read:,} games read ({summary}) ({elapsed:.0f}s, {rate:,.0f} games/s).")
     return selected_games, selected_count
 
@@ -459,26 +559,36 @@ def main():
             log(f"--- Found pass-1 cache at {ELIGIBLE_CACHE_PATH}, skipping pass 1 ---")
             with open(ELIGIBLE_CACHE_PATH, encoding="utf-8") as f:
                 cached = json.load(f)
-            eligible_players = {cat: set(cached.get(cat, [])) for cat in TARGET_SPEED_CATEGORIES}
+            player_mean_elo = {cat: cached.get(cat, {}) for cat in TARGET_SPEED_CATEGORIES}
+            eligible_players = {cat: set(player_mean_elo[cat].keys()) for cat in TARGET_SPEED_CATEGORIES}
         else:
             log("--- Pass 1: counting valid games per player and category ---")
-            counts = first_pass_count_players(ZST_PATH, TARGET_SPEED_CATEGORIES, log)
+            counts, elo_sums = first_pass_count_players(ZST_PATH, TARGET_SPEED_CATEGORIES, log)
 
             eligible_players = {
                 cat: {p for p, c in counts[cat].items() if c >= MIN_GAMES_PER_PLAYER}
                 for cat in TARGET_SPEED_CATEGORIES
             }
+            player_mean_elo = {
+                cat: {p: elo_sums[cat][p] / counts[cat][p] for p in eligible_players[cat]}
+                for cat in TARGET_SPEED_CATEGORIES
+            }
 
             with open(ELIGIBLE_CACHE_PATH, "w", encoding="utf-8") as f:
-                json.dump({cat: sorted(players) for cat, players in eligible_players.items()}, f)
+                json.dump(player_mean_elo, f)
             log(f"Saved eligible-players cache to {ELIGIBLE_CACHE_PATH}")
 
         for cat in TARGET_SPEED_CATEGORIES:
             log(f"[{cat}] Players with >= {MIN_GAMES_PER_PLAYER} valid games: {len(eligible_players[cat]):,}")
 
+        log("\n--- Building Elo buckets for stratified sampling ---")
+        player_bucket, bucket_target = build_elo_buckets(
+            eligible_players, player_mean_elo, TARGET_PLAYERS_PER_CATEGORY, log
+        )
+
         log("\n--- Pass 2: selecting games from those players ---")
         games, selected_count = second_pass_select_games(
-            ZST_PATH, eligible_players, TARGET_PLAYERS_PER_CATEGORY, log
+            ZST_PATH, eligible_players, player_bucket, bucket_target, log
         )
     except KeyboardInterrupt:
         log("\nInterrupted by the user during pass 1 (nothing to save yet).")

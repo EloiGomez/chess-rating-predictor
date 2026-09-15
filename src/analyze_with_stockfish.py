@@ -154,6 +154,9 @@ def analyze_one_game(headers: dict, moves_uci: list, engine: chess.engine.Simple
     quality = compute_move_quality(evals)
 
     return {
+        # site -- a stable per-game id (the game's Lichess URL), used to
+        # resume a checkpointed run without re-analyzing games already done.
+        "site": headers.get("Site", ""),
         # usernames -- needed to be able to group games by player later on.
         "white": headers.get("White", ""),
         "black": headers.get("Black", ""),
@@ -168,11 +171,16 @@ def analyze_one_game(headers: dict, moves_uci: list, engine: chess.engine.Simple
     }
 
 
-def read_tasks(input_path: str, max_games: int) -> list:
+def read_tasks(input_path: str, max_games: int, skip_sites: set = frozenset()) -> list:
     """Reads games from the input PGN and returns a list of
     (task_id, headers, moves_uci) tuples ready to be sent to worker
     processes. Only plain, picklable data (dicts, lists of strings) is
-    kept -- not chess.pgn.Game objects."""
+    kept -- not chess.pgn.Game objects.
+
+    Games whose "Site" is in `skip_sites` (already analyzed in a previous,
+    interrupted run of this same output file -- see analyze_pgn's
+    checkpointing) are skipped, so resuming doesn't redo completed work.
+    `max_games` counts NEW games queued, not games skipped."""
     tasks = []
     with open(input_path, encoding="utf-8", errors="replace") as pgn_file:
         while len(tasks) < max_games:
@@ -181,6 +189,9 @@ def read_tasks(input_path: str, max_games: int) -> list:
                 break  # end of file
 
             headers = dict(game.headers)
+            if headers.get("Site", "") in skip_sites:
+                continue
+
             white_elo = headers.get("WhiteElo", "")
             black_elo = headers.get("BlackElo", "")
             if not white_elo.isdigit() or not black_elo.isdigit():
@@ -214,10 +225,26 @@ def worker_loop(stockfish_path: str, depth: int, task_queue: mp.Queue, result_qu
         engine.quit()
 
 
+CHECKPOINT_EVERY = 200  # games; balances "little lost on a crash" against CSV-write overhead
+
+
 def analyze_pgn(input_path: str, output_path: str, max_games: int, num_workers: int, depth: int, log) -> int:
-    log(f"Reading up to {max_games} games from {input_path}...")
-    tasks = read_tasks(input_path, max_games)
+    resumed_rows = []
+    skip_sites = set()
+    if os.path.exists(output_path):
+        resumed_df = pd.read_csv(output_path)
+        resumed_rows = resumed_df.to_dict("records")
+        skip_sites = set(resumed_df["site"].astype(str)) if "site" in resumed_df.columns else set()
+        log(f"Found existing {output_path} with {len(resumed_rows):,} games already analyzed -- resuming, "
+            "skipping those.")
+
+    log(f"Reading up to {max_games} NEW games from {input_path}...")
+    tasks = read_tasks(input_path, max_games, skip_sites)
     log(f"{len(tasks)} games queued for analysis at depth {depth} with {num_workers} parallel worker(s).")
+
+    if not tasks:
+        log("Nothing left to analyze -- output is already complete.")
+        return len(resumed_rows)
 
     task_queue: mp.Queue = mp.Queue()
     result_queue: mp.Queue = mp.Queue()
@@ -232,6 +259,16 @@ def analyze_pgn(input_path: str, output_path: str, max_games: int, num_workers: 
     ]
     for w in workers:
         w.start()
+
+    def checkpoint(rows_by_id):
+        """Writes everything analyzed so far (resumed + new) to disk. Called
+        periodically, not just at the end, so an interruption that doesn't
+        get a chance to run cleanup code -- a crash, a forced shutdown, a
+        killed process -- loses at most CHECKPOINT_EVERY games of work
+        instead of the entire run."""
+        rows = resumed_rows + [rows_by_id[i] for i in sorted(rows_by_id)]
+        pd.DataFrame(rows).to_csv(output_path, index=False)
+        return rows
 
     rows_by_id = {}
     start_time = time.time()
@@ -252,9 +289,11 @@ def analyze_pgn(input_path: str, output_path: str, max_games: int, num_workers: 
                 elapsed = time.time() - start_time
                 avg_per_game = elapsed / n_done
                 log(
-                    f"Analyzed {n_done}/{len(tasks)} games... "
+                    f"Analyzed {n_done}/{len(tasks)} new games... "
                     f"({avg_per_game:.2f}s/game wall-clock, {elapsed:.0f}s elapsed)"
                 )
+            if n_done % CHECKPOINT_EVERY == 0:
+                checkpoint(rows_by_id)
     except KeyboardInterrupt:
         log("\nInterrupted by user -- saving whatever was analyzed so far...")
     finally:
@@ -263,14 +302,14 @@ def analyze_pgn(input_path: str, output_path: str, max_games: int, num_workers: 
         for w in workers:
             w.join()
 
-    rows = [rows_by_id[i] for i in sorted(rows_by_id)]
+    rows = checkpoint(rows_by_id)
 
     elapsed_total = time.time() - start_time
-    avg_per_game = elapsed_total / len(rows) if rows else 0
+    n_new = len(rows_by_id)
+    avg_per_game = elapsed_total / n_new if n_new else 0
 
-    pd.DataFrame(rows).to_csv(output_path, index=False)
-
-    log(f"\nTotal time: {elapsed_total:.1f}s for {len(rows)} games ({avg_per_game:.2f}s/game wall-clock average)")
+    log(f"\nTotal time: {elapsed_total:.1f}s for {n_new} new games ({avg_per_game:.2f}s/game wall-clock average), "
+        f"{len(rows):,} games total in {output_path}")
     if avg_per_game > 0:
         for n in (2000, 3000):
             estimate_minutes = (avg_per_game * n) / 60

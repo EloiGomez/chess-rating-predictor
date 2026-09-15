@@ -118,7 +118,17 @@ def to_long_format(games: pd.DataFrame) -> pd.DataFrame:
     """Converts the games DataFrame (one row per game, white_*/black_*
     columns) into a "long" DataFrame: one row per player participation in
     a game, with their own columns (without the white_/black_ prefix)
-    plus the opponent's Elo."""
+    plus the opponent's Elo AND the opponent's move-quality features.
+
+    The opponent's ACPL/blunders (unlike the opponent's ELO, which is
+    deliberately excluded from training -- see train_baseline.py) isn't
+    just a proxy for the target: Lichess pairs players by rating, not by
+    how cleanly they happen to play in one game, so it doesn't inherit
+    that leakage. It's still informative though -- a sloppy game from the
+    OPPONENT is a sign the position itself was messy/complicated, which
+    puts the player's own ACPL in that same game into context: the same
+    own_acpl means something different in a game where the opponent also
+    struggled versus one where they played cleanly."""
     has_clock = "white_avg_time_per_move" in games.columns and "black_avg_time_per_move" in games.columns
 
     sides = []
@@ -131,6 +141,10 @@ def to_long_format(games: pd.DataFrame) -> pd.DataFrame:
             "own_blunders": games[f"{side}_blunders"],
             "own_mistakes": games[f"{side}_mistakes"],
             "own_inaccuracies": games[f"{side}_inaccuracies"],
+            "opponent_acpl": games[f"{opponent}_acpl"],
+            "opponent_blunders": games[f"{opponent}_blunders"],
+            "opponent_mistakes": games[f"{opponent}_mistakes"],
+            "opponent_inaccuracies": games[f"{opponent}_inaccuracies"],
             "won": (games["result"] == win_result).astype(int),
             "num_plies": games["num_plies"],
             "eco": games["eco"],
@@ -202,9 +216,14 @@ def aggregate_players(long_df: pd.DataFrame, min_games: int, max_games: int) -> 
         avg_mistakes=("own_mistakes", "mean"),
         avg_inaccuracies=("own_inaccuracies", "mean"),
         avg_opponent_elo=("opponent_elo", "mean"),
+        avg_opponent_acpl=("opponent_acpl", "mean"),
+        avg_opponent_blunders=("opponent_blunders", "mean"),
+        avg_opponent_mistakes=("opponent_mistakes", "mean"),
+        avg_opponent_inaccuracies=("opponent_inaccuracies", "mean"),
         win_rate=("won", "mean"),
         avg_num_plies=("num_plies", "mean"),
     )
+    numeric_agg["acpl_diff"] = numeric_agg["avg_acpl"] - numeric_agg["avg_opponent_acpl"]
     if "own_avg_time_per_move" in capped.columns:
         numeric_agg["avg_time_per_move"] = capped.groupby("username")["own_avg_time_per_move"].mean()
 

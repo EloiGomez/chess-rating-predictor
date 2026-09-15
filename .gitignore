@@ -17,6 +17,9 @@ data/processed/*
 # Logs from select_games_by_player.py / analyze_with_stockfish.py runs
 logs/
 
+# Trained models (regenerate with train_baseline.py --save-model-dir models)
+models/
+
 # Old stray log file
 log_seleccion.txt
 

@@ -2,5 +2,8 @@ python-chess
 pandas
 scikit-learn
 zstandard~=0.25.0
+streamlit
+joblib
+requests
 
 chess~=1.11.2
