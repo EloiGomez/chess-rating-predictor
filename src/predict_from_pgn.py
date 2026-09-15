@@ -20,7 +20,7 @@ import chess.pgn
 import pandas as pd
 
 from analyze_with_stockfish import get_eval_sequence, compute_move_quality
-from extract_clock_features import per_move_times
+from extract_clock_features import per_move_times, time_budget
 from aggregate_by_player import estimate_speed_category
 
 MIN_GAMES_REQUIRED = 5
@@ -73,6 +73,11 @@ def analyze_player_games(games: list, username: str, engine: chess.engine.Simple
 
         white_times, black_times = per_move_times(game)
         own_times = white_times if side == "white" else black_times
+        own_avg_time = (sum(own_times) / len(own_times)) if own_times else None
+
+        budget = time_budget(headers.get("TimeControl", ""))
+        per_move_share = budget / 40 if budget else None
+        own_time_ratio = (own_avg_time / per_move_share) if (own_avg_time is not None and per_move_share) else None
 
         rows.append({
             "own_elo": int(own_elo_str) if own_elo_str.isdigit() else None,
@@ -88,7 +93,8 @@ def analyze_player_games(games: list, username: str, engine: chess.engine.Simple
             "num_plies": len(evals) - 1,
             "eco": headers.get("ECO", ""),
             "speed_category": estimate_speed_category(headers.get("TimeControl", "")),
-            "avg_time_per_move": (sum(own_times) / len(own_times)) if own_times else None,
+            "avg_time_per_move": own_avg_time,
+            "time_ratio": own_time_ratio,
         })
 
     return rows
@@ -126,6 +132,7 @@ def aggregate_player_rows(rows: list, speed_category: str) -> dict:
         "acpl_diff": avg_acpl - avg_opponent_acpl,
         "win_rate": df["won"].mean(),
         "avg_time_per_move": df["avg_time_per_move"].mean(),
+        "avg_time_ratio": df["time_ratio"].mean(),
         "main_eco": eco_mode.iat[0] if not eco_mode.empty else "",
         "reported_elo": df["own_elo"].mean(),  # for display/comparison only -- NOT a model input
     }
@@ -153,6 +160,7 @@ def build_model_input(features: dict, feature_columns: list, top_eco: list) -> p
         "acpl_diff": features["acpl_diff"],
         "win_rate": features["win_rate"],
         "avg_time_per_move": features["avg_time_per_move"],
+        "avg_time_ratio": features["avg_time_ratio"],
         f"main_eco_grouped_{eco_grouped}": 1,
     }
 

@@ -106,6 +106,26 @@ def build_features(df: pd.DataFrame, speed_category: str, top_eco=None):
         ]
     if "avg_time_per_move" in df.columns:
         numeric_features.append("avg_time_per_move")
+    if "avg_time_ratio" in df.columns:
+        # avg_time_per_move in raw seconds isn't directly comparable across
+        # time controls that share a speed category but have different
+        # clocks (e.g. 60+0 vs 120+1, both "bullet") -- caught from a real
+        # player who plays 120+1 exclusively in an ~82%-60+0 bullet dataset
+        # and was mispredicted by over 500 Elo. avg_time_ratio expresses
+        # time usage as a fraction of that game's own budget instead (see
+        # extract_clock_features.py's time_budget()).
+        #
+        # It's kept ALONGSIDE avg_time_per_move, not as a replacement: a
+        # direct test of replacing it made the model meaningfully WORSE
+        # (bullet R^2 0.889 -> 0.847) -- apparently raw play speed carries
+        # real signal beyond "speed relative to this game's clock" (faster
+        # players may just be objectively faster, in absolute terms, more
+        # or less regardless of the specific time control). Keeping both
+        # gives a small net improvement overall, though it doesn't fully
+        # fix predictions for players who mostly play a minority time
+        # control within their speed category -- the model still leans on
+        # the raw feature, which is confounded for exactly those players.
+        numeric_features.append("avg_time_ratio")
 
     # main_speed_category has no variance once the dataset is restricted to
     # a single speed, so it wouldn't survive drop_first's collinearity

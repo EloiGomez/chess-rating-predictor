@@ -88,12 +88,12 @@ def estimate_speed_category(time_control: str) -> str:
 
 
 def merge_clock_features(games: pd.DataFrame, clock_path: str) -> pd.DataFrame:
-    """Merges in white_avg_time_per_move / black_avg_time_per_move from
-    extract_clock_features.py's output. The two files are matched by ROW
-    POSITION (both come from processing the same PGN in the same order),
-    so this checks White/Black Elo line up before trusting the merge --
-    if they don't, the clock columns are skipped entirely rather than
-    silently attaching the wrong game's time data to a player."""
+    """Merges in white/black_avg_time_per_move and white/black_time_ratio
+    from extract_clock_features.py's output. The two files are matched by
+    ROW POSITION (both come from processing the same PGN in the same
+    order), so this checks White/Black Elo line up before trusting the
+    merge -- if they don't, the clock columns are skipped entirely rather
+    than silently attaching the wrong game's time data to a player."""
     clock = pd.read_csv(clock_path)
 
     if len(clock) != len(games):
@@ -109,8 +109,9 @@ def merge_clock_features(games: pd.DataFrame, clock_path: str) -> pd.DataFrame:
         return games
 
     games = games.copy()
-    games["white_avg_time_per_move"] = clock["white_avg_time_per_move"].values
-    games["black_avg_time_per_move"] = clock["black_avg_time_per_move"].values
+    for col in ("white_avg_time_per_move", "black_avg_time_per_move", "white_time_ratio", "black_time_ratio"):
+        if col in clock.columns:
+            games[col] = clock[col].values
     return games
 
 
@@ -130,6 +131,7 @@ def to_long_format(games: pd.DataFrame) -> pd.DataFrame:
     own_acpl means something different in a game where the opponent also
     struggled versus one where they played cleanly."""
     has_clock = "white_avg_time_per_move" in games.columns and "black_avg_time_per_move" in games.columns
+    has_time_ratio = "white_time_ratio" in games.columns and "black_time_ratio" in games.columns
 
     sides = []
     for side, opponent, win_result in (("white", "black", "1-0"), ("black", "white", "0-1")):
@@ -152,6 +154,8 @@ def to_long_format(games: pd.DataFrame) -> pd.DataFrame:
         }
         if has_clock:
             columns["own_avg_time_per_move"] = games[f"{side}_avg_time_per_move"]
+        if has_time_ratio:
+            columns["own_time_ratio"] = games[f"{side}_time_ratio"]
         sides.append(pd.DataFrame(columns))
 
     long_df = pd.concat(sides, ignore_index=True)
@@ -226,6 +230,8 @@ def aggregate_players(long_df: pd.DataFrame, min_games: int, max_games: int) -> 
     numeric_agg["acpl_diff"] = numeric_agg["avg_acpl"] - numeric_agg["avg_opponent_acpl"]
     if "own_avg_time_per_move" in capped.columns:
         numeric_agg["avg_time_per_move"] = capped.groupby("username")["own_avg_time_per_move"].mean()
+    if "own_time_ratio" in capped.columns:
+        numeric_agg["avg_time_ratio"] = capped.groupby("username")["own_time_ratio"].mean()
 
     categorical_agg = capped.groupby("username").agg(
         main_eco=("eco", mode_or_empty),

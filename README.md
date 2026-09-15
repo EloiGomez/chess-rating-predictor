@@ -17,8 +17,8 @@ time control, evaluated on a held-out 20% of players:
 
 | Time control | Players | Best model | MAE (Elo points) | R² |
 |---|---|---|---|---|
-| Bullet | 3,258 | Gradient Boosting | 196 | 0.887 |
-| Blitz | 3,437 | Random Forest | 170 | 0.915 |
+| Bullet | 3,258 | Gradient Boosting | 192 | 0.889 |
+| Blitz | 3,437 | Gradient Boosting | 164 | 0.918 |
 
 For context: always predicting the dataset mean gets a MAE of roughly
 650-700 points, so the model is explaining the large majority of the
@@ -224,6 +224,23 @@ code:
   noise (an opponent's blunder, a bad day). Averaging Stockfish-derived
   features over several games of the same player is much more stable, and
   is what actually makes prediction from move quality feasible at all.
+
+- **Normalize time-per-move by that game's own clock, but don't rely on it
+  alone.** "Bullet" spans several actual time controls with very different
+  clocks (60+0 is ~82% of this dataset, but 120+1 -- with roughly double
+  the budget -- makes up most of the rest). A raw seconds-per-move average
+  isn't comparable across them: a player who exclusively plays 120+1 got
+  mispredicted by 500+ Elo points because their time usage looked nothing
+  like the 60+0 majority the model mostly learned from. `avg_time_ratio`
+  (time spent as a fraction of that specific game's budget) fixes the
+  comparability problem -- but a direct test of *replacing*
+  `avg_time_per_move` with it made the model meaningfully worse overall
+  (bullet R² 0.889 -> 0.847), so it's kept as an additional feature rather
+  than a replacement. That means minority-time-control players like the
+  one above aren't fully fixed -- the model still leans on the raw,
+  confounded feature where it's more informative for the majority. A
+  cleaner fix would need a per-time-control model or an explicit
+  interaction term, not just another averaged feature.
 
 ## Next steps
 
