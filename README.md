@@ -15,10 +15,14 @@ same player gives a much more stable signal to predict their rating from.
 Trained on real Lichess data (August 2026 dump), one dedicated model per
 time control, evaluated on a held-out 20% of players:
 
-| Time control | Players | Best model | MAE (Elo points) | R² |
+| Time control | Players | Model | MAE (Elo points) | R² |
 |---|---|---|---|---|
-| Bullet | 3,258 | Gradient Boosting | 192 | 0.889 |
-| Blitz | 3,437 | Gradient Boosting | 164 | 0.918 |
+| Bullet | 3,258 | Ridge | 279 | 0.808 |
+| Bullet | 3,258 | Random Forest | 199 | 0.883 |
+| Bullet | 3,258 | **Gradient Boosting (deployed)** | **192** | **0.889** |
+| Blitz | 3,437 | Ridge | 214 | 0.872 |
+| Blitz | 3,437 | Random Forest | 168 | 0.917 |
+| Blitz | 3,437 | **Gradient Boosting (deployed)** | **164** | **0.918** |
 
 For context: always predicting the dataset mean gets a MAE of roughly
 650-700 points, so the model is explaining the large majority of the
