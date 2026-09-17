@@ -67,19 +67,28 @@ collect their games), covering ALL target categories in each single pass
     left far fewer players than expected).
 
     Pass 2 also samples EACH category's players in a STRATIFIED way across
-    Elo bands (ELO_BUCKET_WIDTH-point buckets), instead of just taking
-    whichever eligible players happen to show up first while scanning.
-    Without this, the selection ends up shaped like Lichess's overall
-    rating distribution -- heavily concentrated around the median, with
-    almost no players at the tails -- because prolific players near the
-    median contribute a disproportionate share of raw games in the file.
-    A model trained on that skew learns the middle of the range well and
-    is unreliable for anyone far from it (a 3200-rated player looks
-    nothing like anyone the model has seen). Pass 1 also tracks each
-    player's mean Elo (not just their game count) so pass 2 can target a
-    roughly even number of qualified players FROM EACH BUCKET (capped by
-    how many are actually available in that bucket -- sparse extreme
-    buckets will naturally end up smaller, that's expected, not an error).
+    Elo bands (ELO_BUCKET_WIDTH-point buckets) CROSSED WITH each player's
+    own dominant exact time control (e.g. "60+0" vs "120+1", both
+    "bullet"), instead of just taking whichever eligible players happen to
+    show up first while scanning. Without the Elo stratification, the
+    selection ends up shaped like Lichess's overall rating distribution --
+    heavily concentrated around the median, with almost no players at the
+    tails -- because prolific players near the median contribute a
+    disproportionate share of raw games in the file. A model trained on
+    that skew learns the middle of the range well and is unreliable for
+    anyone far from it (a 3200-rated player looks nothing like anyone the
+    model has seen). Without the time-control stratification on top, a
+    speed category ends up dominated by whichever exact time control is
+    most common on Lichess (e.g. ~82% "60+0" within bullet), so a player
+    who mostly plays a minority variant (like "120+1") is poorly
+    represented -- this was caught from a real player mispredicted by over
+    500 Elo for exactly that reason. Pass 1 tracks each player's mean Elo
+    AND a per-time-control game count (so their single most-played exact
+    time control -- their "dominant" one -- can be worked out afterwards),
+    so pass 2 can target a roughly even number of qualified players FROM
+    EACH (Elo bucket, dominant time control) COMBINATION (capped by how
+    many are actually available in that combination -- sparse ones will
+    naturally end up smaller, that's expected, not an error).
 
 Pass 1 cache (eligible players per category). If ELIGIBLE_CACHE_PATH
 already exists, pass 1 is SKIPPED entirely and the cached result is used
@@ -130,7 +139,7 @@ MAX_GAMES_PER_PLAYER = 15   # stops one very active player from dominating the s
 # reached the minimum (not by counting raw games read -- see the
 # docstring above). With MAX_GAMES_PER_PLAYER as a cap, each category's
 # final dataset will have at most TARGET_PLAYERS_PER_CATEGORY * 15 games.
-TARGET_PLAYERS_PER_CATEGORY = 3_000
+TARGET_PLAYERS_PER_CATEGORY = 9_000
 
 # Width, in Elo points, of the bands pass 2 tries to sample evenly from
 # (see the docstring above). Finer buckets (lower width) give more
@@ -138,6 +147,14 @@ TARGET_PLAYERS_PER_CATEGORY = 3_000
 # target (target_players_per_category / n_buckets) -- which bites hardest
 # in the already-sparse extreme buckets.
 ELO_BUCKET_WIDTH = 100
+
+# How many of each category's most common dominant exact time controls
+# (e.g. "60+0", "120+1") get their OWN bucket dimension; every other,
+# rarer one is grouped into a single "other" bucket. Without this cap, a
+# long tail of one-off/exotic time controls would each carve out their own
+# (mostly empty) bucket, diluting the per-bucket target for buckets that
+# actually matter.
+N_TOP_TIME_CONTROLS_PER_CATEGORY = 6
 
 MIN_PLIES = 10              # discards near-empty / aborted games
 LOG_EVERY_PASS1 = 2_000_000  # how often (in headers read) to print progress
@@ -332,9 +349,13 @@ def first_pass_count_players(path, target_categories, log):
     which skips the rest of the game without tokenizing moves) and counts
     how many valid games each player has IN EACH TARGET CATEGORY, plus the
     sum of their Elo across those games (so a mean Elo -- used to bucket
-    them for stratified sampling in pass 2 -- can be computed afterwards)."""
+    them for stratified sampling in pass 2 -- can be computed afterwards),
+    plus a per-exact-time-control game count for each player (so their
+    single most-played time control -- e.g. "60+0" vs "120+1" -- can be
+    worked out afterwards too, see dominant_time_control())."""
     counts = {cat: {} for cat in target_categories}
     elo_sums = {cat: {} for cat in target_categories}
+    tc_counts = {cat: {} for cat in target_categories}
     n_read = 0
     start = time.time()
 
@@ -355,46 +376,118 @@ def first_pass_count_players(path, target_categories, log):
             if category not in counts:
                 continue
 
+            time_control = headers.get("TimeControl", "")
             player_counts = counts[category]
             player_elo_sums = elo_sums[category]
+            player_tc_counts = tc_counts[category]
             for player, elo_str in (
                 (headers["White"], headers["WhiteElo"]),
                 (headers["Black"], headers["BlackElo"]),
             ):
                 player_counts[player] = player_counts.get(player, 0) + 1
                 player_elo_sums[player] = player_elo_sums.get(player, 0) + int(elo_str)
+                player_tc = player_tc_counts.setdefault(player, {})
+                player_tc[time_control] = player_tc.get(time_control, 0) + 1
 
     elapsed = time.time() - start
     rate = n_read / elapsed if elapsed else 0
     log(f"Pass 1 complete: {n_read:,} games read in total ({elapsed:.0f}s, {rate:,.0f} games/s).")
-    return counts, elo_sums
+    return counts, elo_sums, tc_counts
 
 
-def build_elo_buckets(eligible_players, player_mean_elo, target_players_per_category, log):
-    """Assigns each eligible player to an Elo bucket and works out, per
-    category, how many qualified players pass 2 should aim to collect FROM
-    EACH bucket: the target split evenly across that category's populated
-    buckets, capped at how many eligible players actually exist in a given
-    bucket (a sparse bucket just ends up smaller -- there's no way to
-    manufacture players who aren't in the data)."""
+def dominant_time_control(tc_counts_for_player: dict) -> str:
+    """A player's single most-played exact time control (e.g. "60+0"),
+    used as one axis of pass 2's sampling buckets alongside their Elo band.
+    Ties are broken by sorting the keys first, so the result is
+    deterministic regardless of dict insertion order."""
+    return max(sorted(tc_counts_for_player), key=lambda tc: tc_counts_for_player[tc])
+
+
+def build_sampling_buckets(eligible_players, player_mean_elo, player_time_control,
+                            target_players_per_category, log):
+    """Assigns each eligible player to a (Elo bucket, dominant time
+    control) bucket and works out, per category, how many qualified
+    players pass 2 should aim to collect FROM EACH bucket: the target
+    split evenly across that category's populated buckets, capped at how
+    many eligible players actually exist in a given bucket (a sparse
+    bucket just ends up smaller -- there's no way to manufacture players
+    who aren't in the data).
+
+    The time-control axis is capped to each category's
+    N_TOP_TIME_CONTROLS_PER_CATEGORY most common ones (by number of
+    eligible players whose dominant time control it is); every rarer one
+    is grouped into a single "other" bucket instead of getting its own."""
     player_bucket = {}
     bucket_target = {}
 
     for cat, players in eligible_players.items():
-        player_bucket[cat] = {p: elo_bucket(player_mean_elo[cat][p]) for p in players}
+        tc_pool_size = {}
+        for p in players:
+            tc = player_time_control[cat][p]
+            tc_pool_size[tc] = tc_pool_size.get(tc, 0) + 1
+        top_tcs = set(sorted(tc_pool_size, key=lambda tc: tc_pool_size[tc], reverse=True)
+                      [:N_TOP_TIME_CONTROLS_PER_CATEGORY])
+
+        def tc_label(tc):
+            return tc if tc in top_tcs else "other"
+
+        player_bucket[cat] = {
+            p: (elo_bucket(player_mean_elo[cat][p]), tc_label(player_time_control[cat][p]))
+            for p in players
+        }
 
         pool_size = {}
         for bucket in player_bucket[cat].values():
             pool_size[bucket] = pool_size.get(bucket, 0) + 1
 
-        n_buckets = len(pool_size)
-        even_share = math.ceil(target_players_per_category / n_buckets) if n_buckets else 0
-        bucket_target[cat] = {bucket: min(even_share, size) for bucket, size in pool_size.items()}
+        # Split target_players_per_category across time-control groups
+        # WEIGHTED BY POPULARITY (sqrt of each group's pool size), not
+        # evenly. A fully even split (the previous behavior) makes a rare
+        # variant like bullet's "60+1" (12K eligible players) count for
+        # almost as much of the sample as the dominant "60+0" (291K
+        # eligible) -- which fixes minority-format players being
+        # mispredicted, but leaves the dataset unrepresentative of what a
+        # typical real user of the app actually plays. A fully proportional
+        # split would swing back to the ORIGINAL problem (minority formats
+        # reduced to almost nothing). Weighting by the SQUARE ROOT of pool
+        # size is a middle ground: popular time controls still get
+        # noticeably more of the sample, but rare ones keep a meaningful
+        # floor instead of being crushed.
+        tc_grouped_pool = {}
+        for p in players:
+            label = tc_label(player_time_control[cat][p])
+            tc_grouped_pool[label] = tc_grouped_pool.get(label, 0) + 1
+        tc_weight = {label: math.sqrt(size) for label, size in tc_grouped_pool.items()}
+        weight_sum = sum(tc_weight.values()) or 1
+        tc_target = {
+            label: max(1, round(target_players_per_category * w / weight_sum))
+            for label, w in tc_weight.items()
+        }
+
+        # WITHIN each time-control group, still split evenly across Elo
+        # bands -- that's where the original, single biggest R^2 win of
+        # this project came from (see the module docstring), and it
+        # shouldn't be diluted by the popularity weighting above.
+        n_elo_buckets_per_tc = {}
+        for (elo_b, tc_b) in pool_size:
+            n_elo_buckets_per_tc[tc_b] = n_elo_buckets_per_tc.get(tc_b, 0) + 1
+
+        bucket_target[cat] = {}
+        for bucket, size in pool_size.items():
+            elo_b, tc_b = bucket
+            even_share_within_tc = math.ceil(tc_target[tc_b] / n_elo_buckets_per_tc[tc_b])
+            bucket_target[cat][bucket] = min(even_share_within_tc, size)
 
         achievable = sum(bucket_target[cat].values())
-        log(f"[{cat}] Elo buckets (target {even_share}/bucket, capped by availability):")
-        for bucket in sorted(bucket_target[cat], key=lambda b: int(b.split("-")[0])):
-            log(f"    {bucket:>11}: {bucket_target[cat][bucket]:>5,} target (of {pool_size[bucket]:,} eligible)")
+        log(f"[{cat}] Time controls kept as their own bucket: {sorted(top_tcs)} "
+            f"(every other one grouped as 'other')")
+        log(f"[{cat}] Popularity-weighted time-control targets (sqrt of pool size): " +
+            ", ".join(f"{tc}={tc_target[tc]:,}" for tc in sorted(tc_target, key=lambda t: -tc_target[t])))
+        log(f"[{cat}] Elo x time-control buckets (capped by availability):")
+        for bucket in sorted(bucket_target[cat], key=lambda b: (int(b[0].split("-")[0]), b[1])):
+            elo_b, tc_b = bucket
+            log(f"    {elo_b:>11} / {tc_b:<8}: {bucket_target[cat][bucket]:>5,} target "
+                f"(of {pool_size[bucket]:,} eligible)")
         log(f"[{cat}] Achievable total across all buckets: {achievable:,} "
             f"(requested {target_players_per_category:,})")
 
@@ -555,15 +648,35 @@ def main():
     games = None
     selected_count = None
     try:
+        cached = None
         if os.path.exists(ELIGIBLE_CACHE_PATH):
-            log(f"--- Found pass-1 cache at {ELIGIBLE_CACHE_PATH}, skipping pass 1 ---")
             with open(ELIGIBLE_CACHE_PATH, encoding="utf-8") as f:
-                cached = json.load(f)
-            player_mean_elo = {cat: cached.get(cat, {}) for cat in TARGET_SPEED_CATEGORIES}
+                candidate = json.load(f)
+            # Cache format changed when time-control stratification was
+            # added: each player used to map straight to a mean-Elo float,
+            # now maps to {"elo": ..., "time_control": ...}. An old-format
+            # cache has no time-control data to bucket on, so it can't be
+            # reused -- fall through to a fresh pass 1 instead of crashing
+            # on it or silently sampling without the new stratification.
+            is_old_format = any(
+                not isinstance(v, dict) for cat_data in candidate.values() for v in cat_data.values()
+            )
+            if is_old_format:
+                log(f"--- Found pass-1 cache at {ELIGIBLE_CACHE_PATH}, but it's in the old format "
+                    "(no time-control data) -- ignoring it and re-running pass 1 ---")
+            else:
+                log(f"--- Found pass-1 cache at {ELIGIBLE_CACHE_PATH}, skipping pass 1 ---")
+                cached = candidate
+
+        if cached is not None:
+            player_mean_elo = {cat: {p: d["elo"] for p, d in cached.get(cat, {}).items()}
+                                for cat in TARGET_SPEED_CATEGORIES}
+            player_time_control = {cat: {p: d["time_control"] for p, d in cached.get(cat, {}).items()}
+                                    for cat in TARGET_SPEED_CATEGORIES}
             eligible_players = {cat: set(player_mean_elo[cat].keys()) for cat in TARGET_SPEED_CATEGORIES}
         else:
             log("--- Pass 1: counting valid games per player and category ---")
-            counts, elo_sums = first_pass_count_players(ZST_PATH, TARGET_SPEED_CATEGORIES, log)
+            counts, elo_sums, tc_counts = first_pass_count_players(ZST_PATH, TARGET_SPEED_CATEGORIES, log)
 
             eligible_players = {
                 cat: {p for p, c in counts[cat].items() if c >= MIN_GAMES_PER_PLAYER}
@@ -573,17 +686,28 @@ def main():
                 cat: {p: elo_sums[cat][p] / counts[cat][p] for p in eligible_players[cat]}
                 for cat in TARGET_SPEED_CATEGORIES
             }
+            player_time_control = {
+                cat: {p: dominant_time_control(tc_counts[cat][p]) for p in eligible_players[cat]}
+                for cat in TARGET_SPEED_CATEGORIES
+            }
 
+            cache_data = {
+                cat: {
+                    p: {"elo": player_mean_elo[cat][p], "time_control": player_time_control[cat][p]}
+                    for p in eligible_players[cat]
+                }
+                for cat in TARGET_SPEED_CATEGORIES
+            }
             with open(ELIGIBLE_CACHE_PATH, "w", encoding="utf-8") as f:
-                json.dump(player_mean_elo, f)
+                json.dump(cache_data, f)
             log(f"Saved eligible-players cache to {ELIGIBLE_CACHE_PATH}")
 
         for cat in TARGET_SPEED_CATEGORIES:
             log(f"[{cat}] Players with >= {MIN_GAMES_PER_PLAYER} valid games: {len(eligible_players[cat]):,}")
 
-        log("\n--- Building Elo buckets for stratified sampling ---")
-        player_bucket, bucket_target = build_elo_buckets(
-            eligible_players, player_mean_elo, TARGET_PLAYERS_PER_CATEGORY, log
+        log("\n--- Building Elo x time-control buckets for stratified sampling ---")
+        player_bucket, bucket_target = build_sampling_buckets(
+            eligible_players, player_mean_elo, player_time_control, TARGET_PLAYERS_PER_CATEGORY, log
         )
 
         log("\n--- Pass 2: selecting games from those players ---")

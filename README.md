@@ -13,19 +13,23 @@ same player gives a much more stable signal to predict their rating from.
 ## Results
 
 Trained on real Lichess data (August 2026 dump), one dedicated model per
-time control, evaluated on a held-out 20% of players:
+time control, evaluated on a held-out 20% of players. As of the latest
+run, players are sampled not just evenly across the Elo range but also
+across each category's most common exact time controls (see "Design
+notes"), so the pool is 3x bigger and considerably more diverse than
+earlier versions of this table:
 
 | Time control | Players | Model | MAE (Elo points) | R² |
 |---|---|---|---|---|
-| Bullet | 3,258 | Ridge | 279 | 0.808 |
-| Bullet | 3,258 | Random Forest | 199 | 0.883 |
-| Bullet | 3,258 | **Gradient Boosting (deployed)** | **192** | **0.889** |
-| Blitz | 3,437 | Ridge | 214 | 0.872 |
-| Blitz | 3,437 | Random Forest | 168 | 0.917 |
-| Blitz | 3,437 | **Gradient Boosting (deployed)** | **164** | **0.918** |
+| Bullet | 9,221 | Ridge | 286 | 0.749 |
+| Bullet | 9,221 | Random Forest | 211 | 0.849 |
+| Bullet | 9,221 | **Gradient Boosting (deployed)** | **202** | **0.859** |
+| Blitz | 8,970 | Ridge | 212 | 0.832 |
+| Blitz | 8,970 | Random Forest | 176 | 0.878 |
+| Blitz | 8,970 | **Gradient Boosting (deployed)** | **168** | **0.887** |
 
 For context: always predicting the dataset mean gets a MAE of roughly
-650-700 points, so the model is explaining the large majority of the
+580-615 points, so the model is explaining the large majority of the
 variance in players' ratings from move-quality features alone -- without
 ever being told the player's Elo history.
 
@@ -35,20 +39,40 @@ whole Elo range** (see "Design notes" below) instead of however a scan of
 the dump happens to encounter them. Before that fix, R² on the same
 features and models was 0.28-0.62.
 
+**A note on these specific numbers going slightly down from an earlier,
+smaller version of this table** (bullet was 192 MAE / 0.889 R² on 3,258
+players; blitz was 164 / 0.918 on 3,437): that's not a regression in the
+model. It's testing on a harder, more honest population. The larger run
+deliberately added players from rare Elo bands and minority time controls
+(down to a handful of real players in some cells) that the smaller,
+more curated pool never had to contend with. A spot-check against random
+real players outside the curated training set (`spot_check.py`) backs
+this up: the *old* blitz model's real-world MAE against truly random
+players was ~211-213, well above its own formal 164 -- while the *new*
+model's real-world MAE came out at 205.5, closer to its (higher-looking)
+formal 168. The gap between "how the model scores on its own test set"
+and "how it actually does against a random stranger" shrank from ~47
+points to ~37. That gap closing is the real signal that this dataset
+change helped, even though the headline MAE number went up.
+
 Most influential features (bullet):
-`avg_num_plies` and `avg_time_per_move` dominate -- under bullet's time
-pressure, *how* someone manages the clock and how long their games last
-says more about their level than raw move accuracy.
+`avg_num_plies` (average game length) dominates on its own (0.51) --
+under bullet's time pressure, how long a player's games tend to last says
+more about their level than raw move accuracy.
 
 Most influential features (blitz):
-`avg_acpl` (Stockfish's move-quality score) dominates on its own (0.63)
--- with more time to think, actual move quality is what gives skill away.
+`avg_opening_acpl` dominates heavily (0.76). Take this one with a grain
+of salt: it's highly correlated with the overall `avg_acpl` and the other
+phase-specific ACPL features, and Random Forest importances tend to dump
+most of the credit onto one feature from a correlated cluster rather than
+splitting it evenly -- so this reads more as "move quality in general
+matters most" than "the opening specifically is what matters."
 
 ![Feature importance, bullet vs blitz](docs/feature_importance.png)
 
 *(Random Forest importances shown for both, since HistGradientBoostingRegressor
--- the winning model for bullet -- doesn't expose them at all; regenerate
-with `python src/plot_feature_importance.py`.)*
+-- the winning model for both categories -- doesn't expose them at all;
+regenerate with `python src/plot_feature_importance.py`.)*
 
 ## Try it: the Streamlit demo
 
@@ -62,6 +86,12 @@ their own recent games -- run through the exact same Stockfish analysis
 and feature pipeline the models were trained on. Needs at least 5 games
 in the chosen time control, and a trained model in `models/` (see
 "Full pipeline" below to build one, or train against the sample data).
+If `train_baseline.py` was run with `--save-model-dir`, all three models
+(Ridge / Random Forest / Gradient Boosting) get saved, and the app lets
+you pick which one to use, not just the winner. The prediction also comes
+with a rough ± range based on the model's own MAE, and an expander
+showing exactly which features fed into that prediction (versus ones that
+were computed but aren't used by the currently-loaded model).
 
 ## Project structure
 
@@ -145,8 +175,13 @@ game (White/Black rating, opening, number of plies, result).
    python src/analyze_with_stockfish.py \
        --input data/processed/selected_games_bullet.pgn \
        --output data/processed/games_engine_bullet.csv \
-       --max-games 60000 --depth 12
+       --max-games 200000 --depth 12
    ```
+   **`--max-games` defaults to 2,000 if you omit it** -- fine for a quick
+   test, but pass a number comfortably above your selected PGN's actual
+   game count (check with `grep -c "^\[Event" selected_games_bullet.pgn`)
+   or the run will silently stop early and every step downstream
+   (aggregation, training) will be working off a tiny, incomplete slice.
    Runs several Stockfish processes in parallel (`--workers`, defaults to
    roughly half the machine's logical CPU count, since Stockfish gets
    little benefit from hyperthreading) and is the slowest step by far --
@@ -155,7 +190,8 @@ game (White/Black rating, opening, number of plies, result).
    Checkpoints to `--output` every 200 games and, if that file already
    exists when you (re-)run it, resumes from it instead of redoing
    already-analyzed games -- safe to re-run after any interruption,
-   including a crash.
+   including a crash, or to deliberately pause a long run (e.g.
+   `TaskStop`/Ctrl+C) and continue it later.
 
 4. **Extract time-per-move from clock comments** (optional but recommended;
    repeat per category):
@@ -184,8 +220,9 @@ game (White/Black rating, opening, number of plies, result).
        --save-model-dir models
    ```
    Trains Ridge, Random Forest and Gradient Boosting, reports MAE/R² for
-   each, and saves the best one to `models/model_bullet.joblib` for
-   `app.py` to load.
+   each, and (with `--save-model-dir`) saves all three separately (e.g.
+   `models/model_bullet_gradient_boosting.joblib`) plus the best one under
+   the plain `models/model_bullet.joblib` name, for `app.py` to load.
 
 ## Design notes
 
@@ -202,7 +239,10 @@ code:
   anyone it's seen). `select_games_by_player.py` now buckets eligible
   players into `ELO_BUCKET_WIDTH`-point bands and samples a roughly even
   number from EACH band (capped by how many actually exist in a sparse
-  band). This one change took R² from 0.28-0.62 to 0.89-0.92.
+  band). This one change took R² from 0.28-0.62 to the 0.85-0.92 range
+  seen in the Results table above (the exact number moves around a bit as
+  the dataset and features evolve, but the jump from this fix is the
+  single biggest lever pulled in this project).
 
 - **Never mix time controls for the same player.** Lichess gives every
   player a separate rating per speed (someone can be 2400 in bullet and
@@ -231,26 +271,65 @@ code:
 
 - **Normalize time-per-move by that game's own clock, but don't rely on it
   alone.** "Bullet" spans several actual time controls with very different
-  clocks (60+0 is ~82% of this dataset, but 120+1 -- with roughly double
-  the budget -- makes up most of the rest). A raw seconds-per-move average
-  isn't comparable across them: a player who exclusively plays 120+1 got
-  mispredicted by 500+ Elo points because their time usage looked nothing
-  like the 60+0 majority the model mostly learned from. `avg_time_ratio`
-  (time spent as a fraction of that specific game's budget) fixes the
-  comparability problem -- but a direct test of *replacing*
-  `avg_time_per_move` with it made the model meaningfully worse overall
-  (bullet R² 0.889 -> 0.847), so it's kept as an additional feature rather
-  than a replacement. That means minority-time-control players like the
-  one above aren't fully fixed -- the model still leans on the raw,
-  confounded feature where it's more informative for the majority. A
-  cleaner fix would need a per-time-control model or an explicit
-  interaction term, not just another averaged feature.
+  clocks (e.g. 60+0 vs 120+1, roughly double the budget). A raw
+  seconds-per-move average isn't comparable across them: a player who
+  exclusively plays 120+1 got mispredicted by 500+ Elo points because
+  their time usage looked nothing like the 60+0 majority the model mostly
+  learned from. `avg_time_ratio` (time spent as a fraction of that
+  specific game's budget) helps, but a direct test of *replacing*
+  `avg_time_per_move` with it made the model meaningfully worse overall,
+  so it's kept as an additional feature rather than a replacement. See the
+  next two notes for the more complete fix that followed.
+
+- **Stratify sampling by exact time control too, not just Elo -- weighted
+  by real popularity.** The Elo-only stratification above still let
+  whichever time control happens to be most common within a speed
+  category (e.g. bullet's 60+0) dominate the sample, which is exactly what
+  caused the 120+1 mispredictions above. `select_games_by_player.py` now
+  buckets players by (Elo band, dominant exact time control), capping the
+  time-control axis to each category's `N_TOP_TIME_CONTROLS_PER_CATEGORY`
+  most common ones (everything rarer gets grouped as "other"). The split
+  across those buckets is weighted by the **square root** of each time
+  control's real population, not evenly and not fully proportionally:
+  fully even would make a time control played by 12K people count for
+  almost as much of the sample as one played by 291K, making the dataset
+  unrepresentative of a typical real user; fully proportional would swing
+  back to the original 120+1 problem, crushing rare formats down to almost
+  nothing. The square root is a deliberate middle ground. `aggregate_by_player.py`
+  then restricts each player to only their games at that single dominant
+  exact time control (not just the same speed category) when computing
+  their averages -- and `predict_from_pgn.py` applies the same restriction
+  live, but *only* when the loaded model was actually trained with it
+  (checked via whether `base_time` is one of its feature columns), so an
+  older deployed model doesn't silently get fed features computed a
+  different way than it learned from.
+
+- **Split move quality by game phase.** A single ACPL number per game
+  hides *where* in the game a player is strong or weak -- someone can be
+  booked-up and precise in the opening but shaky in technique once
+  simplified, or vice versa. `analyze_with_stockfish.py` now classifies
+  each move into opening (first 20 plies), middlegame, or endgame (once
+  both queens are off the board -- the simplest correct rule available)
+  and computes ACPL/blunders/mistakes/inaccuracies separately for each,
+  with `predict_from_pgn.py`/`aggregate_by_player.py` falling back to a
+  player's overall stat when a short game never reaches a given phase.
 
 ## Next steps
 
-- [ ] Phase-specific move quality (opening/middlegame/endgame ACPL)
-      instead of one number per game.
 - [ ] A dedicated rapid dataset -- currently too small a slice of Lichess
       traffic to train (and evaluate) reliably.
 - [ ] Cross-validation instead of a single train/test split, for a more
       robust MAE/R² estimate.
+- [ ] Filter out high-RD/provisional players (few total games, unreliable
+      Glicko-2 rating) from training and spot-checks -- found to skew at
+      least one spot-check outlier (a player with only 9 total games).
+- [ ] A quick "estimate from just 1 game" mode, trained separately on
+      per-game (not per-player-averaged) rows. A rough experiment on older
+      data put single-game R² at only ~0.26 vs ~0.86-0.89 from averaging
+      5-15 games, so this would be a deliberately low-precision, fast
+      alternative to the main predictor, not a replacement for it.
+- [ ] Retest that single-game idea with a much larger player pool (the
+      full eligible pool per category, not just the curated few thousand),
+      since a single game per player is cheap to collect at scale -- to
+      see whether more (if still individually noisy) examples narrow the
+      gap at all.

@@ -44,6 +44,15 @@ from sklearn.metrics import mean_absolute_error, r2_score
 DEFAULT_DATA_PATH = "data/processed/players.csv"
 TOP_ECO_COUNT = 30
 
+# Filename fragment for each model, when saving one file per model type
+# (see main()'s --save-model-dir handling) so the Streamlit app can offer
+# a choice between them instead of only ever deploying the single winner.
+MODEL_SLUGS = {
+    "Ridge (regularized linear)": "ridge",
+    "Random Forest": "random_forest",
+    "Gradient Boosting": "gradient_boosting",
+}
+
 
 def load_data(data_path: str, speed_category: str) -> pd.DataFrame:
     df = pd.read_csv(data_path)
@@ -126,6 +135,26 @@ def build_features(df: pd.DataFrame, speed_category: str, top_eco=None):
         # control within their speed category -- the model still leans on
         # the raw feature, which is confounded for exactly those players.
         numeric_features.append("avg_time_ratio")
+    if "base_time" in df.columns:
+        # Each player is restricted (in aggregate_by_player.py) to games
+        # played at a single exact time control, not just a shared speed
+        # category -- a 3+0 blitz game and a 5+3 one are both "blitz" but
+        # play very differently (much more thinking time per move in the
+        # latter, in absolute terms). base_time/increment tell the model
+        # exactly which time control this player's stats come from.
+        numeric_features += ["base_time", "increment"]
+    if "avg_opening_acpl" in df.columns:
+        # Split move quality by game phase (opening: first 20 plies;
+        # endgame: once both queens are off the board; middlegame:
+        # everything between) instead of one ACPL number for the whole
+        # game -- a player can be booked-up and precise in the opening but
+        # shaky in endgame technique, or vice versa, and a single average
+        # hides that. See analyze_with_stockfish.py's classify_phase().
+        for phase in ("opening", "middlegame", "endgame"):
+            numeric_features += [
+                f"avg_{phase}_acpl", f"avg_{phase}_blunders",
+                f"avg_{phase}_mistakes", f"avg_{phase}_inaccuracies",
+            ]
 
     # main_speed_category has no variance once the dataset is restricted to
     # a single speed, so it wouldn't survive drop_first's collinearity
@@ -194,12 +223,14 @@ def main():
 
     print("\n--- Results ---")
     best_name, best_r2, best_mae = None, float("-inf"), None
+    results = {}  # name -> (mae, r2), kept for saving every model, not just the winner
     for name, model in models.items():
         model.fit(X_train, y_train)
         y_pred = model.predict(X_test)
 
         mae = mean_absolute_error(y_test, y_pred)
         r2 = r2_score(y_test, y_pred)
+        results[name] = (mae, r2)
 
         print(f"\n{name}")
         print(f"  MAE (mean absolute error): {mae:.1f} Elo points")
@@ -218,25 +249,41 @@ def main():
         print(f"  {feat}: {importance:.3f}")
 
     if args.save_model_dir:
-        print(f"\nRetraining best model ({best_name}) on all {len(X)} players for deployment...")
-        final_model = models[best_name]
-        final_model.fit(X, y)  # use every available player, not just the 80% split
-
         os.makedirs(args.save_model_dir, exist_ok=True)
         label = args.speed_category or "mixed"
-        model_path = os.path.join(args.save_model_dir, f"model_{label}.joblib")
-        joblib.dump({
-            "model": final_model,
-            "model_name": best_name,
-            "speed_category": args.speed_category,
-            "feature_columns": list(X.columns),
-            "top_eco": top_eco,
-            "test_r2": best_r2,
-            "test_mae": best_mae,
-            "n_players_trained_on": len(X),
-        }, model_path)
-        print(f"Saved to {model_path} (test R^2={best_r2:.3f}, test MAE={best_mae:.1f}, "
-              f"trained on {len(X)} players)")
+
+        # Save EVERY model, not just the winner -- lets the Streamlit app
+        # offer a choice between them (e.g. to compare a simpler, more
+        # interpretable Ridge against the strongest Gradient Boosting one)
+        # instead of only ever being able to deploy whichever had the best
+        # test R^2 on this particular split.
+        for name, model in models.items():
+            mae, r2 = results[name]
+            print(f"\nRetraining {name} on all {len(X)} players for deployment...")
+            model.fit(X, y)  # use every available player, not just the 80% split
+
+            slug = MODEL_SLUGS[name]
+            model_path = os.path.join(args.save_model_dir, f"model_{label}_{slug}.joblib")
+            joblib.dump({
+                "model": model,
+                "model_name": name,
+                "speed_category": args.speed_category,
+                "feature_columns": list(X.columns),
+                "top_eco": top_eco,
+                "test_r2": r2,
+                "test_mae": mae,
+                "n_players_trained_on": len(X),
+                "is_best": name == best_name,
+            }, model_path)
+            print(f"Saved to {model_path} (test R^2={r2:.3f}, test MAE={mae:.1f})")
+
+        # Also save the winner under the plain model_{label}.joblib name --
+        # kept for scripts (spot_check.py) and docs that expect "the"
+        # deployed model without picking a specific one.
+        best_path = os.path.join(args.save_model_dir, f"model_{label}.joblib")
+        best_slug_path = os.path.join(args.save_model_dir, f"model_{label}_{MODEL_SLUGS[best_name]}.joblib")
+        joblib.dump(joblib.load(best_slug_path), best_path)
+        print(f"\nBest model ({best_name}) also saved to {best_path} for backward compatibility.")
 
 
 if __name__ == "__main__":

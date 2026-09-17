@@ -13,6 +13,7 @@ extract_clock_features.py) and loads a model trained by train_baseline.py
     streamlit run app.py
 """
 
+import glob
 import os
 import sys
 
@@ -39,24 +40,49 @@ MODELS_DIR = "models"
 # numbers on a different scale than what it learned from.
 ANALYSIS_DEPTH = 12
 
+# Display names for each model type train_baseline.py --save-model-dir
+# saves (one file per type: model_{category}_{slug}.joblib), so the
+# selectbox can show a readable label without having to load every model
+# file just to read its "model_name" field.
+MODEL_LABELS = {
+    "ridge": "Ridge (regularized linear)",
+    "random_forest": "Random Forest",
+    "gradient_boosting": "Gradient Boosting (usually strongest)",
+}
+
 st.set_page_config(page_title="Chess Rating Predictor", page_icon="♞")
 
 
+def available_model_slugs(speed_category: str) -> list:
+    """Which per-model-type files exist for this speed category (e.g.
+    "ridge", "gradient_boosting"), so the UI can offer a choice. Empty on
+    an older models/ directory that only has the single model_{category}.joblib
+    file from before train_baseline.py started saving one file per type."""
+    prefix = f"model_{speed_category}_"
+    pattern = os.path.join(MODELS_DIR, f"{prefix}*.joblib")
+    return sorted(
+        os.path.splitext(os.path.basename(path))[0][len(prefix):]
+        for path in glob.glob(pattern)
+    )
+
+
 @st.cache_resource
-def load_model(speed_category: str):
-    path = os.path.join(MODELS_DIR, f"model_{speed_category}.joblib")
+def load_model(speed_category: str, model_slug: str = None):
+    filename = f"model_{speed_category}.joblib" if model_slug is None else f"model_{speed_category}_{model_slug}.joblib"
+    path = os.path.join(MODELS_DIR, filename)
     if not os.path.exists(path):
         return None
     return joblib.load(path)
 
 
-def run_prediction(pgn_text: str, username: str, speed_category: str, max_games: int = MAX_GAMES_USED):
+def run_prediction(pgn_text: str, username: str, speed_category: str, model_slug: str = None,
+                    max_games: int = MAX_GAMES_USED):
     games = parse_games_for_player(pgn_text, username)
     if not games:
         st.error(f"No games found for '{username}' in the provided PGN.")
         return
 
-    bundle = load_model(speed_category)
+    bundle = load_model(speed_category, model_slug)
     if bundle is None:
         st.error(
             f"No trained model found for '{speed_category}' yet. "
@@ -79,8 +105,15 @@ def run_prediction(pgn_text: str, username: str, speed_category: str, max_games:
         engine.quit()
         progress.empty()
 
+    # Only restrict to the player's single most common EXACT time control
+    # if the loaded model was actually trained with that restriction
+    # (see aggregate_by_player.py's restrict_to_main_time_control) --
+    # otherwise this would compute averages a different way than whatever
+    # model happens to be deployed was trained with, silently skewing
+    # predictions.
+    restrict_exact_time_control = "base_time" in bundle["feature_columns"]
     try:
-        features = aggregate_player_rows(rows, speed_category)
+        features = aggregate_player_rows(rows, speed_category, restrict_exact_time_control)
     except ValueError as error:
         st.error(
             f"{error} Try fetching/uploading more {speed_category} games "
@@ -90,12 +123,17 @@ def run_prediction(pgn_text: str, username: str, speed_category: str, max_games:
 
     X = build_model_input(features, bundle["feature_columns"], bundle["top_eco"])
     predicted_elo = bundle["model"].predict(X)[0]
+    mae = bundle["test_mae"]
 
     st.subheader(f"Predicted {speed_category} Elo: {predicted_elo:.0f}")
+    st.write(
+        f"Likely somewhere around **{predicted_elo - mae:.0f} – {predicted_elo + mae:.0f}** "
+        f"(±{mae:.0f}, this model's typical error on players it wasn't trained on -- "
+        "not a strict statistical interval, just a ballpark)."
+    )
     st.caption(
-        f"Based on {features['n_games']} game(s). Model's typical error on held-out players: "
-        f"±{bundle['test_mae']:.0f} points (R²={bundle['test_r2']:.2f}, "
-        f"trained on {bundle['n_players_trained_on']:,} players)."
+        f"Based on {features['n_games']} game(s). Model: {bundle['model_name']} "
+        f"(R²={bundle['test_r2']:.2f}, trained on {bundle['n_players_trained_on']:,} players)."
     )
 
     if features["reported_elo"] is not None:
@@ -105,8 +143,35 @@ def run_prediction(pgn_text: str, username: str, speed_category: str, max_games:
             delta=f"{predicted_elo - features['reported_elo']:+.0f} predicted - actual",
         )
 
-    with st.expander("Features used for this prediction"):
-        st.json({k: (round(v, 2) if isinstance(v, float) else v) for k, v in features.items()})
+    # Not every feature this script CALCULATES is necessarily used by the
+    # loaded model -- e.g. the game-phase and exact-time-control features
+    # are always computed here, but only feed into predictions once a
+    # model has actually been retrained with them (see train_baseline.py).
+    # Splitting the two avoids the confusing impression that everything
+    # shown was necessarily used to produce predicted_elo above.
+    model_columns = set(bundle["feature_columns"])
+    used = {k: v for k, v in features.items() if k in model_columns}
+    not_used = {
+        k: v for k, v in features.items()
+        if k not in model_columns and k not in ("main_eco", "reported_elo")
+    }
+    eco_is_used = any(col.startswith("main_eco_grouped_") for col in model_columns)
+
+    def _fmt(d):
+        return {k: (round(v, 2) if isinstance(v, float) else v) for k, v in d.items()}
+
+    with st.expander("Features used by this model"):
+        st.json(_fmt(used))
+        if eco_is_used:
+            st.caption(f"Plus opening (main_eco={features['main_eco']}), one-hot encoded.")
+
+    if not_used:
+        with st.expander("Also computed, but NOT used by this model yet"):
+            st.caption(
+                "These are calculated for every prediction, but this particular model was trained "
+                "before they existed as features -- they're shown for visibility, not used above."
+            )
+            st.json(_fmt(not_used))
 
 
 st.title("♞ Chess Rating Predictor")
@@ -116,6 +181,19 @@ st.write(
 )
 
 speed_category = st.selectbox("Time control", ["bullet", "blitz"])
+
+model_slugs = available_model_slugs(speed_category)
+if model_slugs:
+    model_slug = st.selectbox(
+        "Model", model_slugs, format_func=lambda slug: MODEL_LABELS.get(slug, slug),
+        help="Different models trade off differently -- Gradient Boosting is usually the strongest, "
+             "Ridge is simpler and more interpretable, Random Forest is in between.",
+    )
+else:
+    # Older models/ directory with only the single model_{category}.joblib
+    # file (from before train_baseline.py started saving one file per model
+    # type) -- fall back to that, no choice to offer.
+    model_slug = None
 
 tab_fetch, tab_upload = st.tabs(["Fetch from Lichess", "Upload / paste PGN"])
 
@@ -132,7 +210,7 @@ with tab_fetch:
                 if not pgn_text.strip():
                     st.error(f"'{username}' has no rated {speed_category} games on Lichess.")
                 else:
-                    run_prediction(pgn_text, username, speed_category, max_games)
+                    run_prediction(pgn_text, username, speed_category, model_slug=model_slug, max_games=max_games)
             except LichessApiError as error:
                 st.error(str(error))
 
@@ -152,4 +230,4 @@ with tab_upload:
         elif not pgn_text.strip():
             st.warning("Upload a file or paste some PGN text first.")
         else:
-            run_prediction(pgn_text, upload_username, speed_category)
+            run_prediction(pgn_text, upload_username, speed_category, model_slug=model_slug)

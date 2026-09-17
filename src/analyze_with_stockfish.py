@@ -34,14 +34,16 @@ import pandas as pd
 LOG_DIR = "logs"
 
 
-def make_logger():
+def make_logger(prefix: str = "analyze_stockfish"):
     """Creates a logger that writes every line to the console AND to a
     timestamped UTF-8 file under logs/, flushing immediately. Without this,
     stdout gets block-buffered when it isn't connected to a terminal (e.g.
     when redirected to a file or captured by a background-task runner), so
-    progress prints can sit invisible for minutes at a time."""
+    progress prints can sit invisible for minutes at a time. Shared by any
+    script that runs long enough to want live progress -- not just this
+    one -- hence the `prefix` parameter instead of a hardcoded filename."""
     os.makedirs(LOG_DIR, exist_ok=True)
-    log_path = os.path.join(LOG_DIR, f"analyze_stockfish_{time.strftime('%Y%m%d_%H%M%S')}.log")
+    log_path = os.path.join(LOG_DIR, f"{prefix}_{time.strftime('%Y%m%d_%H%M%S')}.log")
     log_file = open(log_path, "a", encoding="utf-8")
 
     def log(msg: str, file=None) -> None:
@@ -81,32 +83,59 @@ INACCURACY_THRESHOLD = 50
 MISTAKE_THRESHOLD = 100
 BLUNDER_THRESHOLD = 300
 
+# Game-phase boundaries for the phase-specific quality stats below. Both
+# are deliberately simple, well-known heuristics rather than anything
+# requiring an opening book or a finely-tuned material curve: "opening" is
+# the first OPENING_PLY_CUTOFF plies (10 moves/side, roughly where most
+# players' memorized theory runs out), "endgame" is once both queens are
+# off the board (the standard rule-of-thumb definition), and everything
+# between the two is "middlegame". Precise phase boundaries are inherently
+# fuzzy in chess -- these don't need to be exact, just consistent, since
+# the features that use them are averaged over many plies per bucket.
+OPENING_PLY_CUTOFF = 20
+PHASES = ("opening", "middlegame", "endgame")
 
-def get_eval_sequence(moves_uci: list, engine: chess.engine.SimpleEngine, depth: int) -> list:
-    """Returns Stockfish's evaluation (in centipawns, from White's
-    perspective) at every position of the game: the starting position and
-    after each move. Takes the moves as UCI strings (e.g. "e2e4") so this
-    can be called from a worker process without needing to pickle a full
-    chess.pgn.Game object."""
+
+def classify_phase(board: chess.Board, ply: int) -> str:
+    if ply <= OPENING_PLY_CUTOFF:
+        return "opening"
+    if not board.pieces(chess.QUEEN, chess.WHITE) and not board.pieces(chess.QUEEN, chess.BLACK):
+        return "endgame"
+    return "middlegame"
+
+
+def get_eval_sequence(moves_uci: list, engine: chess.engine.SimpleEngine, depth: int) -> tuple:
+    """Returns (evals, phases): Stockfish's evaluation (in centipawns, from
+    White's perspective) and the game phase at every position of the game
+    -- the starting position and after each move. Takes the moves as UCI
+    strings (e.g. "e2e4") so this can be called from a worker process
+    without needing to pickle a full chess.pgn.Game object."""
     board = chess.Board()
     evals = []
+    phases = []
 
     info = engine.analyse(board, chess.engine.Limit(depth=depth))
     evals.append(info["score"].white().score(mate_score=1000))
+    phases.append(classify_phase(board, 0))
 
-    for uci in moves_uci:
+    for ply, uci in enumerate(moves_uci, start=1):
         board.push(chess.Move.from_uci(uci))
         info = engine.analyse(board, chess.engine.Limit(depth=depth))
         evals.append(info["score"].white().score(mate_score=1000))
+        phases.append(classify_phase(board, ply))
 
-    return evals
+    return evals, phases
 
 
-def compute_move_quality(evals: list) -> dict:
-    """From the sequence of evaluations, computes ACPL and the number of
-    blunders/mistakes/inaccuracies for each player."""
-    white_losses = []
-    black_losses = []
+def compute_move_quality(evals: list, phases: list) -> dict:
+    """From the sequence of evaluations and per-ply game phases, computes
+    ACPL and the number of blunders/mistakes/inaccuracies for each player
+    -- both overall (unchanged from before, for backward compatibility)
+    and broken down per game phase (opening/middlegame/endgame), since
+    "how well someone plays" isn't one number: a player might be
+    booked-up and precise in the opening but shaky in endgame technique,
+    or vice versa, and averaging that all into a single ACPL hides it."""
+    losses = {side: {phase: [] for phase in PHASES} for side in ("white", "black")}
 
     for ply_index in range(1, len(evals)):
         before = evals[ply_index - 1]
@@ -114,44 +143,49 @@ def compute_move_quality(evals: list) -> dict:
 
         # odd ply_index (1, 3, 5...) = White moved; even = Black moved
         moved_white = (ply_index % 2 == 1)
+        phase = phases[ply_index]
 
         if moved_white:
             loss = max(0, before - after)
-            white_losses.append(loss)
+            losses["white"][phase].append(loss)
         else:
             loss = max(0, after - before)
-            black_losses.append(loss)
+            losses["black"][phase].append(loss)
 
-    def summarize(losses):
-        if not losses:
+    def summarize(loss_list):
+        if not loss_list:
             return {"acpl": None, "blunders": 0, "mistakes": 0, "inaccuracies": 0}
         return {
-            "acpl": sum(losses) / len(losses),
-            "blunders": sum(1 for l in losses if l >= BLUNDER_THRESHOLD),
-            "mistakes": sum(1 for l in losses if MISTAKE_THRESHOLD <= l < BLUNDER_THRESHOLD),
-            "inaccuracies": sum(1 for l in losses if INACCURACY_THRESHOLD <= l < MISTAKE_THRESHOLD),
+            "acpl": sum(loss_list) / len(loss_list),
+            "blunders": sum(1 for l in loss_list if l >= BLUNDER_THRESHOLD),
+            "mistakes": sum(1 for l in loss_list if MISTAKE_THRESHOLD <= l < BLUNDER_THRESHOLD),
+            "inaccuracies": sum(1 for l in loss_list if INACCURACY_THRESHOLD <= l < MISTAKE_THRESHOLD),
         }
 
-    white_stats = summarize(white_losses)
-    black_stats = summarize(black_losses)
+    result = {}
+    for side in ("white", "black"):
+        all_losses = [l for phase in PHASES for l in losses[side][phase]]
+        overall = summarize(all_losses)
+        result[f"{side}_acpl"] = overall["acpl"]
+        result[f"{side}_blunders"] = overall["blunders"]
+        result[f"{side}_mistakes"] = overall["mistakes"]
+        result[f"{side}_inaccuracies"] = overall["inaccuracies"]
 
-    return {
-        "white_acpl": white_stats["acpl"],
-        "white_blunders": white_stats["blunders"],
-        "white_mistakes": white_stats["mistakes"],
-        "white_inaccuracies": white_stats["inaccuracies"],
-        "black_acpl": black_stats["acpl"],
-        "black_blunders": black_stats["blunders"],
-        "black_mistakes": black_stats["mistakes"],
-        "black_inaccuracies": black_stats["inaccuracies"],
-    }
+        for phase in PHASES:
+            phase_stats = summarize(losses[side][phase])
+            result[f"{side}_{phase}_acpl"] = phase_stats["acpl"]
+            result[f"{side}_{phase}_blunders"] = phase_stats["blunders"]
+            result[f"{side}_{phase}_mistakes"] = phase_stats["mistakes"]
+            result[f"{side}_{phase}_inaccuracies"] = phase_stats["inaccuracies"]
+
+    return result
 
 
 def analyze_one_game(headers: dict, moves_uci: list, engine: chess.engine.SimpleEngine, depth: int) -> dict:
     """Analyzes a single game (given as plain headers + a list of UCI
     moves) and returns one output row."""
-    evals = get_eval_sequence(moves_uci, engine, depth)
-    quality = compute_move_quality(evals)
+    evals, phases = get_eval_sequence(moves_uci, engine, depth)
+    quality = compute_move_quality(evals, phases)
 
     return {
         # site -- a stable per-game id (the game's Lichess URL), used to

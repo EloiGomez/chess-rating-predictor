@@ -49,6 +49,21 @@ LABELS = {
     "acpl_diff": "ACPL diff (own - opponent)",
     "win_rate": "win rate",
     "n_games": "games sampled",
+    "avg_time_ratio": "time usage (normalized)",
+    "base_time": "base time",
+    "increment": "increment",
+    "avg_opening_acpl": "avg. ACPL (opening)",
+    "avg_middlegame_acpl": "avg. ACPL (middlegame)",
+    "avg_endgame_acpl": "avg. ACPL (endgame)",
+    "avg_opening_blunders": "avg. blunders (opening)",
+    "avg_middlegame_blunders": "avg. blunders (middlegame)",
+    "avg_endgame_blunders": "avg. blunders (endgame)",
+    "avg_opening_mistakes": "avg. mistakes (opening)",
+    "avg_middlegame_mistakes": "avg. mistakes (middlegame)",
+    "avg_endgame_mistakes": "avg. mistakes (endgame)",
+    "avg_opening_inaccuracies": "avg. inaccuracies (opening)",
+    "avg_middlegame_inaccuracies": "avg. inaccuracies (middlegame)",
+    "avg_endgame_inaccuracies": "avg. inaccuracies (endgame)",
 }
 
 
