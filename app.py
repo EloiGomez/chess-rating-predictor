@@ -39,6 +39,13 @@ MODELS_DIR = "models"
 # analyzing at a different depth would give the model ACPL/blunder
 # numbers on a different scale than what it learned from.
 ANALYSIS_DEPTH = 12
+# How many games the "Games to fetch" slider allows, above
+# predict_from_pgn.MAX_GAMES_USED (15 -- the cap training data used).
+# Averaging over more games than that only reduces noise further (see
+# aggregate_player_rows's docstring), it's just slower here since app.py
+# analyzes games one at a time with a single Stockfish instance rather
+# than the training pipeline's parallel workers.
+MAX_GAMES_FETCHABLE = 30
 
 # Display names for each model type train_baseline.py --save-model-dir
 # saves (one file per type: model_{category}_{slug}.joblib), so the
@@ -113,7 +120,7 @@ def run_prediction(pgn_text: str, username: str, speed_category: str, model_slug
     # predictions.
     restrict_exact_time_control = "base_time" in bundle["feature_columns"]
     try:
-        features = aggregate_player_rows(rows, speed_category, restrict_exact_time_control)
+        features = aggregate_player_rows(rows, speed_category, restrict_exact_time_control, max_games=max_games)
     except ValueError as error:
         st.error(
             f"{error} Try fetching/uploading more {speed_category} games "
@@ -199,7 +206,15 @@ tab_fetch, tab_upload = st.tabs(["Fetch from Lichess", "Upload / paste PGN"])
 
 with tab_fetch:
     username = st.text_input("Lichess username", key="fetch_username")
-    max_games = st.slider("Games to fetch", MIN_GAMES_REQUIRED, MAX_GAMES_USED, 10, key="fetch_max")
+    max_games = st.slider("Games to fetch", MIN_GAMES_REQUIRED, MAX_GAMES_FETCHABLE, 10, key="fetch_max")
+    if max_games > MAX_GAMES_USED:
+        st.caption(
+            f"More than {MAX_GAMES_USED} games goes beyond what the model's training data averaged over. "
+            "This helps if you're a fairly consistent player, but Lichess returns your MOST RECENT games "
+            "first, so a larger window also reaches further back in time -- if your level has been "
+            "changing lately (improving or in a slump), older games pull the average away from your "
+            "current strength rather than just reducing noise. Also slower to analyze here."
+        )
     if st.button("Fetch and predict", key="fetch_button"):
         if not username:
             st.warning("Enter a username first.")

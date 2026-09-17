@@ -109,7 +109,8 @@ def analyze_player_games(games: list, username: str, engine: chess.engine.Simple
     return rows
 
 
-def aggregate_player_rows(rows: list, speed_category: str, restrict_exact_time_control: bool = False) -> dict:
+def aggregate_player_rows(rows: list, speed_category: str, restrict_exact_time_control: bool = False,
+                           max_games: int = MAX_GAMES_USED) -> dict:
     """Averages this player's per-game rows into a single feature dict,
     mirroring aggregate_by_player.py's aggregate_players() for one ad-hoc
     player instead of a whole dataset. Restricted to `speed_category`
@@ -127,7 +128,19 @@ def aggregate_player_rows(rows: list, speed_category: str, restrict_exact_time_c
     at prediction time, an average over only their 180+2 games -- a
     different quantity, not the noise-reduced version of the same one),
     which can silently skew predictions. app.py decides this by checking
-    whether the loaded model's feature_columns include "base_time"."""
+    whether the loaded model's feature_columns include "base_time".
+
+    `max_games` defaults to MAX_GAMES_USED (matching MAX_GAMES_PER_PLAYER,
+    the cap training data used), but callers may raise it. This only
+    reduces noise if the player's true strength was roughly CONSTANT over
+    all those games -- caller beware: app.py's `rows` come from
+    Lichess's most-recent-games-first API, so a larger max_games also
+    reaches further back in time. For a player whose level has been
+    trending up or down lately, that pulls the average toward their PAST
+    strength rather than just averaging out noise around a stable one --
+    confirmed in practice: a real player's prediction went from
+    near-perfect at 5 games to off by -360 at 15, because their older
+    games were weaker than their current form."""
     df = pd.DataFrame(rows)
     df = df[df["speed_category"] == speed_category]
 
@@ -137,7 +150,7 @@ def aggregate_player_rows(rows: list, speed_category: str, restrict_exact_time_c
             main_base_time, main_increment = tc_counts.idxmax()
             df = df[(df["base_time"] == main_base_time) & (df["increment"] == main_increment)]
 
-    df = df.head(MAX_GAMES_USED)
+    df = df.head(max_games)
 
     if len(df) < MIN_GAMES_REQUIRED:
         extra = (
